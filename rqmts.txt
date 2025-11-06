@@ -3,3 +3,7 @@ matplotlib
 numpy
 pandas_market_calendars
 arch
+tensorflow
+scikit-learn
+torch 
+lightning
