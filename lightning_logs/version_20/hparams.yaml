@@ -1,0 +1,7 @@
+dilation_channels: 64
+end_channels: 64
+kernel_size: 3
+lr_patience: 5
+num_blocks: 2
+residual_channels: 32
+skip_channels: 128

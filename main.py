@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import lightning.pytorch as pl
 from torch.utils.data import DataLoader, TensorDataset, Subset
 from lightning.pytorch.callbacks import EarlyStopping, TQDMProgressBar
-from torch.nn import MSELoss
+from torch.nn import L1Loss
 
 # --- Imports for Evaluation ---
 import matplotlib.pyplot as plt
@@ -24,14 +24,33 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 LR          = 1e-3         # learning-rate (fixed)
 EPS         = 1e-11        # numerical guard (fixed)
 FORWARD     = 5            # forecast horizon in minutes (fixed)
-ANNUALIZATION_FACTOR = np.sqrt(78 * 252)
+TRADING_DAYS_PER_YEAR = 252
+
+# --- NEW: Annualization Factor Dictionary ---
+# Based on a standard 390-minute trading day (e.g., 9:30-16:00)
+TRADING_MINS_PER_DAY = 390
+
+ANNUALIZATION_FACTORS = {
+    # 5-min: 390/5 = 78 periods/day. Factor = sqrt(78 * 252)
+    5: np.sqrt((TRADING_MINS_PER_DAY / 5) * TRADING_DAYS_PER_YEAR),  # ~140.20
+    
+    # 10-min: 390/10 = 39 periods/day. Factor = sqrt(39 * 252)
+    10: np.sqrt((TRADING_MINS_PER_DAY / 10) * TRADING_DAYS_PER_YEAR), # ~99.14
+    
+    # 20-min: 390/20 = 19.5 periods/day. Factor = sqrt(19.5 * 252)
+    20: np.sqrt((TRADING_MINS_PER_DAY / 20) * TRADING_DAYS_PER_YEAR), # ~70.09
+    
+    # 30-min: 390/30 = 13 periods/day. Factor = sqrt(13 * 252)
+    30: np.sqrt((TRADING_MINS_PER_DAY / 30) * TRADING_DAYS_PER_YEAR)  # ~57.21
+}
 
 # ─── PARAMS WE *CAN* TUNE  ────────────────────────────────────────────────
 DEFAULTS = dict(
     window_size       = 10,
     batch_size        = 512,
     max_epochs        = 100,
-    patience          = 15,
+    patience          = 15, # EarlyStopping patience
+    lr_patience       = 5,  # ReduceLROnPlateau patience
     kernel_size       = 3,
     num_blocks        = 4,
     num_layers        = 6,
@@ -44,7 +63,7 @@ DEFAULTS = dict(
 # =======DATA PREP=======
 
 def calculate_realized_volatility(log_returns, window=5):
-    """Calculates 5-minute realized volatility (sqrt of sum of squares)."""
+    """Calculates rolling realized volatility (sqrt of sum of squares)."""
     return log_returns.rolling(window=window).apply(
         lambda x: np.sqrt(np.sum(x**2)), raw=True
     )
@@ -57,54 +76,82 @@ def create_sequences(data, target, sequence_length):
         y.append(target[i + sequence_length])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
-# ---
-# --- FUNCTION HAS BEEN RE-WRITTEN ---
-# ---
 def prepare_rv_data(df, window_size: int = DEFAULTS['window_size']):
     """
-    It now creates (Past 5-min RVs) -> (Next 5-min RV)
-    USING THE PRE-CALCULATED 'return' COLUMN.
+    --- UPDATED ---
+    Uses the static ANNUALIZATION_FACTORS dictionary
+    to apply the correct factor to each horizon.
     """
     
     # 1. Use the 'return' column as our log_return
-    #    We must fill any NaNs (like the first row) with 0.
     df_market = df.copy()
     df_market['log_return'] = df_market['return'].fillna(0).astype(np.float32)
     
-    # 2. Calculate 5-minute Realized Volatility (RV) and Annualize it
-    #    We MUST group by date here to prevent the rolling window
-    #    from crossing over the overnight gap.
-    rv_5min_unscaled = df_market.groupby(df_market.index.floor('D'))['log_return'].apply(
-        lambda x: calculate_realized_volatility(x, window=5)
-    )
-    df_market['rv_5min_annualized'] = rv_5min_unscaled.reset_index(level=0, drop=True) * ANNUALIZATION_FACTOR
+    # --- REMOVED: Dynamic Annualization Factor ---
     
-    # 3. Create the target variable: next 5-min RV (also annualized)
-    df_market['target_rv_5min'] = df_market['rv_5min_annualized'].shift(-FORWARD)
+    # 2. Calculate Realized Volatility (RV) and Annualize it
+    grouped_returns = df_market.groupby(df_market.index.floor('D'))['log_return']
+    
+    # --- UPDATED: Apply correct factor from dictionary ---
+    print("Applying annualization factors:")
+    print(f"  5-min factor: {ANNUALIZATION_FACTORS[5]:.2f}")
+    print(f" 10-min factor: {ANNUALIZATION_FACTORS[10]:.2f}")
+    print(f" 20-min factor: {ANNUALIZATION_FACTORS[20]:.2f}")
+    print(f" 30-min factor: {ANNUALIZATION_FACTORS[30]:.2f}")
+
+    df_market['rv_5min'] = grouped_returns.apply(
+        lambda x: calculate_realized_volatility(x, window=5)
+    ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[5]
+    
+    df_market['rv_10min'] = grouped_returns.apply(
+        lambda x: calculate_realized_volatility(x, window=10)
+    ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[10]
+    
+    df_market['rv_20min'] = grouped_returns.apply(
+        lambda x: calculate_realized_volatility(x, window=20)
+    ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[20]
+    
+    df_market['rv_30min'] = grouped_returns.apply(
+        lambda x: calculate_realized_volatility(x, window=30)
+    ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[30]
+
+    
+    # 3. Create the TRAINING target variable: next 5-min RV
+    df_market['target_rv_5min'] = df_market['rv_5min'].shift(-FORWARD)
 
     # 4. Clean data
-    feature_col = 'rv_5min_annualized'
-    target_col = 'target_rv_5min'
-    # Drop NaNs created by rolling() and shift()
-    df_processed = df_market[[feature_col, target_col]].dropna()
+    all_cols = ['rv_5min', 'rv_10min', 'rv_20min', 'rv_30min', 'target_rv_5min']
+    df_processed = df_market[all_cols].dropna()
     
     print(f"Processed data has {len(df_processed)} rows after cleaning NaNs.")
     if len(df_processed) == 0:
         print("ERROR: No data left after dropna(). Check 'return' column in CSV.")
-        return None, None
+        return None, None, None
 
-    # 5. Create sequences
-    features_data = df_processed[feature_col].values
-    target_data = df_processed[target_col].values
+    # 5. Create sequences for the 5-MIN model
+    features_data = df_processed['rv_5min'].values
+    target_data = df_processed['target_rv_5min'].values
     
-    X, y = create_sequences(features_data, target_data, sequence_length=window_size)
+    features_data_log = np.log(features_data + EPS)
+    target_data_log = np.log(target_data + EPS)
     
-    # Reshape X for Conv1d: [samples, features, timesteps]
+    X, y = create_sequences(features_data_log, target_data_log, sequence_length=window_size)
+    
     X = np.expand_dims(X, axis=1) # -> (B, 1, T)
     
-    print(f"Created {X.shape[0]} sequences with shape {X.shape}.")
+    print(f"Created {X.shape[0]} log-transformed 5-min sequences.")
     
-    return X, y
+    # 6. Get the non-sequenced, aligned data for plotting
+    plot_data = {
+        '5min_actual_target': target_data[window_size:],
+        '10min_actual_cont': df_processed['rv_10min'].values[window_size:],
+        '20min_actual_cont': df_processed['rv_20min'].values[window_size:],
+        '30min_actual_cont': df_processed['rv_30min'].values[window_size:],
+    }
+    
+    assert len(X) == len(plot_data['5min_actual_target']), "Alignment error in data prep"
+    
+    return X, y, plot_data
 
 def load_set(csv_path: str, window_size = DEFAULTS['window_size']):
     """
@@ -118,7 +165,6 @@ def load_set(csv_path: str, window_size = DEFAULTS['window_size']):
         
     print(f"Loaded {len(df)} rows from {csv_path}...")
     
-    # Check for required columns
     if 'timestamp' not in df.columns or 'market_status' not in df.columns or 'return' not in df.columns:
         print("Error: CSV must contain 'timestamp', 'market_status', and 'return' columns.")
         return None
@@ -135,14 +181,17 @@ def load_set(csv_path: str, window_size = DEFAULTS['window_size']):
         
     print(f"Filtered down to {len(df_market)} '{market_status_string}' market rows...")
 
-    X, y = prepare_rv_data(df_market, window_size)
+    X, y, plot_data = prepare_rv_data(df_market, window_size)
     
     if X is None:
         return None
         
     X = torch.from_numpy(X).float()
     y = torch.from_numpy(y).float()
-    return TensorDataset(X, y)
+    
+    full_dataset = TensorDataset(X, y)
+    
+    return full_dataset, plot_data
 
 
 # =======DIALED CASUAL CONVOLUTION=======
@@ -183,7 +232,7 @@ class DeepVol(nn.Module):
         for blk in self.blocks: x, sk = blk(x); skip_sum = skip_sum + sk
         out = self.post(skip_sum)
         out = out.mean(dim=-1).squeeze(-1)
-        return F.softplus(out)
+        return out
 
 #=======TRAINING SCRIPT=======
 # (This section is unchanged)
@@ -194,121 +243,120 @@ class VolModel(pl.LightningModule):
         self.model = DeepVol(**{k: h[k] for k in (
             "num_blocks","kernel_size","residual_channels",
             "dilation_channels","skip_channels","end_channels")})
-        self.loss  = MSELoss()
+        self.loss  = L1Loss(reduction='mean')
         
     def forward(self, x):          
         return self.model(x)
     
     def _step(self,b):
         x, y = b
-        pred_rv = self(x)
-        return self.loss(pred_rv, y)
+        pred_log_rv = self(x)
+        return self.loss(pred_log_rv, y)
     
     def training_step(self,b, _):  
-        l=self._step(b); self.log("train_loss",l); return l
+        l=self.loss(self(b[0]), b[1]); self.log("train_loss",l); return l
     
     def validation_step(self,b,_): 
-        l=self._step(b); self.log("val_loss",l,prog_bar=True)
+        l=self.loss(self(b[0]), b[1]); self.log("val_loss",l,prog_bar=True)
     
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=LR)
+        optimizer = torch.optim.Adam(self.parameters(), lr=LR)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', factor=0.1, 
+            patience=self.hparams.lr_patience, verbose=True
+        )
+        return {"optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"}}
 
-# ======= EVALUATION FUNCTIONS (ADAPTED FROM YOURS) =======
+# ======= EVALUATION FUNCTIONS (ADAPTED) =======
 # (This section is unchanged)
 def evaluate_model(model: pl.LightningModule,
                    test_loader: DataLoader,
                    device: torch.device,
                    eps: float = 1e-11):
     """
-    Compute RMSE, MAE and QLIKE on our RV-to-RV model.
+    Compute RMSE, MAE and QLIKE on our log-RV-to-log-RV model.
     """
     model.eval()
     model.to(device)
-    
-    all_preds = []
-    all_targets = []
+    all_preds_log_rv, all_targets_log_rv = [], []
 
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.to(device), y.to(device)
-            # Get model's RV prediction
-            preds = model(x)
-            all_preds.append(preds.cpu())
-            all_targets.append(y.cpu())
+            preds_log_rv = model(x)
+            all_preds_log_rv.append(preds_log_rv.cpu())
+            all_targets_log_rv.append(y.cpu())
     
-    # Concatenate all batches into single numpy arrays
-    y_pred_rv = torch.cat(all_preds).numpy().astype(np.float64)
-    y_true_rv = torch.cat(all_targets).numpy().astype(np.float64)
+    y_pred_log_rv = torch.cat(all_preds_log_rv).numpy().astype(np.float64)
+    y_true_log_rv = torch.cat(all_targets_log_rv).numpy().astype(np.float64)
+
+    y_pred_rv = np.exp(y_pred_log_rv)
+    y_true_rv = np.exp(y_true_log_rv) # This is the 5-min target
 
     # --- Calculate metrics ---
-    
-    # 1. RMSE and MAE on Volatility (RV)
     rmse = np.sqrt(mean_squared_error(y_true_rv, y_pred_rv))
     mae = mean_absolute_error(y_true_rv, y_pred_rv)
-
-    # 2. QLIKE on Variance (RV^2)
-    # We square the volatility to get variance for the QLIKE calculation
-    y_true_var = np.square(y_true_rv)
-    y_pred_var = np.square(y_pred_rv)
-    
+    y_true_var = np.square(y_true_rv); y_pred_var = np.square(y_pred_rv)
     qlike = np.mean(np.log(y_pred_var + eps) + y_true_var / (y_pred_var + eps))
 
     print("\n––– Model Evaluation (Test Set) –––")
+    print(f"Metrics vs. 5-min Target")
     print(f"RMSE (on Vol):  {rmse:.6f}")
     print(f"MAE (on Vol):   {mae:.6f}")
     print(f"QLIKE (on Var): {qlike:.6f}")
 
     metrics = {"rmse": rmse, "mae": mae, "qlike": qlike}
+    # Return 5-min true, 5-min pred
     return y_true_rv, y_pred_rv, metrics
 
-
-def plot_predictions(y_true: np.ndarray | torch.Tensor,
-                     y_pred: np.ndarray | torch.Tensor,
-                     *,
-                     start: int | None = None,
-                     end:   int | None = None,
-                     title: str = "DeepVol: Actual vs. Predicted Volatility"):
-    """Line‑plot of truth vs forecast over an index slice."""
-    # Convert to numpy if they are tensors
-    if torch.is_tensor(y_true):
-        y_true = y_true.cpu().numpy()
-    if torch.is_tensor(y_pred):
-        y_pred = y_pred.cpu().numpy()
-
-    N = len(y_true)
-    if end is None:
-        end = N
-    if start is None:
-        start = 0
+def plot_single_horizon(y_pred: np.ndarray,
+                        y_true: np.ndarray,
+                        horizon_label: str, # e.g., "5-min"
+                        *,
+                        start: int | None = None,
+                        end:   int | None = None):
+    """
+    Plots the 5-min prediction vs. a single actual RV horizon.
+    """
+    N = len(y_pred)
+    if end is None: end = N
+    if start is None: start = 0
     if not (0 <= start < end <= N):
         raise ValueError("Invalid start/end slice for plotting range.")
 
-    y_t = y_true[start:end]
-    y_p = y_pred[start:end]
     x_range = range(start, end)
+    
+    # Sliced data
+    y_p_slice = y_pred[start:end]
+    y_t_slice = y_true[start:end]
 
     plt.figure(figsize=(15, 6))
-    plt.plot(x_range, y_t, label="Actual Volatility", linewidth=2, color='blue', alpha=0.8)
-    plt.plot(x_range, y_p, label="Predicted Volatility", linewidth=2, linestyle="--", color='red')
-    plt.title(f"{title} (Indices {start}–{end-1})")
+    
+    plt.plot(x_range, y_t_slice, label=f"Actual ({horizon_label} RV)", linewidth=2, color='blue', alpha=0.8)
+    plt.plot(x_range, y_p_slice, label="Model (5-min Prediction)", linewidth=2, linestyle="--", color='red')
+    
+    title = f"Model 5-min Forecast vs. Actual {horizon_label} RV (Indices {start}–{end-1})"
+    filename = f"comparison_{horizon_label.replace('-', '')}.png"
+    
+    plt.title(title)
     plt.xlabel("Sample Index")
     plt.ylabel("Annualized Volatility")
     plt.legend()
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
-    plt.savefig('timeseries_comparison.png')
-    print("Saved timeseries_comparison.png")
+    plt.savefig(filename)
+    print(f"Saved {filename}")
     plt.show()
 
 
-# --- Main execution block ---
-# (This section is unchanged)
+# --- Main execution block (replaces train_deepvol function) ---
 if __name__ == "__main__":
     pl.seed_everything(42) # for reproducibility
     
     # 1. Load and prepare the data
     your_csv_filename = 'final.csv'
-    full_dataset = load_set(csv_path=your_csv_filename)
+    full_dataset, plot_data = load_set(csv_path=your_csv_filename)
     
     if full_dataset:
         # 2. Sequential Train/Val/Test Split
@@ -326,29 +374,17 @@ if __name__ == "__main__":
         print(f"Dataset split: {train_size} train, {valid_size} val, {test_size} test")
 
         # 3. Create DataLoaders
-        loader_train = DataLoader(train_ds,
-                                  batch_size=DEFAULTS['batch_size'],
-                                  shuffle=True,
-                                  num_workers=4,
-                                  persistent_workers=True,
-                                  pin_memory=True)
-        loader_val = DataLoader(valid_ds,
-                                batch_size=DEFAULTS['batch_size'] * 2,
-                                shuffle=False,
-                                num_workers=4,
-                                persistent_workers=True,
-                                pin_memory=True)
-        loader_test = DataLoader(test_ds,
-                                 batch_size=DEFAULTS['batch_size'] * 2,
-                                 shuffle=False,
-                                 num_workers=4,
-                                 persistent_workers=True,
-                                 pin_memory=True)
+        loader_train = DataLoader(train_ds, batch_size=DEFAULTS['batch_size'], shuffle=True,
+                                  num_workers=4, persistent_workers=True, pin_memory=True)
+        loader_val = DataLoader(valid_ds, batch_size=DEFAULTS['batch_size'] * 2, shuffle=False,
+                                num_workers=4, persistent_workers=True, pin_memory=True)
+        loader_test = DataLoader(test_ds, batch_size=DEFAULTS['batch_size'] * 2, shuffle=False,
+                                 num_workers=4, persistent_workers=True, pin_memory=True)
         
         # 4. Initialize Model and Trainer
         hparams = {k: DEFAULTS[k] for k in (
                 "num_blocks","kernel_size","residual_channels",
-                "dilation_channels","skip_channels","end_channels")}
+                "dilation_channels","skip_channels","end_channels", "lr_patience")}
         
         model = VolModel(**hparams)
 
@@ -364,31 +400,71 @@ if __name__ == "__main__":
         )
 
         # 5. Train the Model
-        print("--- Starting Model Training ---")
+        print("--- Starting Model Training (using L1 / MAE Loss) ---")
         trainer.fit(model, loader_train, loader_val)
         print("--- Training Complete ---")
 
-        # 6. Evaluate on Test Set using your adapted function
+        # 6. Evaluate on Test Set
         print("--- Starting Model Evaluation ---")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        y_true_test, y_pred_test, test_metrics = evaluate_model(
+        y_true_5min, y_pred_5min, test_metrics = evaluate_model(
             model, loader_test, device
         )
         
-        # 7. Plot using your adapted function
-        print("Generating evaluation plots...")
-        plot_predictions(y_true_test, y_pred_test, start=100, end=400)
+        # 7. --- UPDATED: Create separate plots ---
+        print("Generating separate evaluation plots...")
         
-        # 8. Plot Scatter
+        test_indices = test_ds.indices
+        
+        # Create a dict of the *test set* plotting data
+        plot_data_test = {
+            '5min_actual': plot_data['5min_actual_target'][test_indices],
+            '10min_actual': plot_data['10min_actual_cont'][test_indices],
+            '20min_actual': plot_data['20min_actual_cont'][test_indices],
+            '30min_actual': plot_data['30min_actual_cont'][test_indices],
+        }
+
+        # Define the slice we want to see
+        plot_start = 100
+        plot_end = 400
+
+        # Plot 1: 5-min Prediction vs 5-min Actual
+        plot_single_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['5min_actual'],
+            horizon_label="5-min",
+            start=plot_start,
+            end=plot_end
+        )
+        
+        # Plot 2: 5-min Prediction vs 10-min Actual
+        plot_single_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['10min_actual'],
+            horizon_label="10-min",
+            start=plot_start,
+            end=plot_end
+        )
+        
+        # Plot 3: 5-min Prediction vs 20-min Actual
+        plot_single_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['20min_actual'],
+            horizon_label="20-min",
+            start=plot_start,
+            end=plot_end
+        )
+        
+        # Plot 4: Scatter (vs. 5-min target)
         plt.figure(figsize=(8, 8))
-        max_val = max(y_true_test.max(), y_pred_test.max()) * 1.05
-        min_val = min(y_true_test.min(), y_pred_test.min()) * 0.95
-        plt.scatter(y_true_test, y_pred_test, alpha=0.3, label='Model vs Actual')
+        max_val = max(y_true_5min.max(), y_pred_5min.max()) * 1.05
+        min_val = min(y_true_5min.min(), y_pred_5min.min()) * 0.95
+        plt.scatter(y_true_5min, y_pred_5min, alpha=0.3, label='Model vs Actual (5-min)')
         plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Fit (y=x)')
-        plt.title('Prediction vs. Actual Scatter Plot')
-        plt.xlabel('Actual Volatility')
-        plt.ylabel('Predicted Volatility')
+        plt.title('Prediction vs. Actual 5-min Scatter Plot')
+        plt.xlabel('Actual 5-min Volatility')
+        plt.ylabel('Predicted 5-min Volatility')
         plt.legend()
         plt.grid(True)
         plt.savefig('scatter_comparison.png')
@@ -396,6 +472,6 @@ if __name__ == "__main__":
         plt.show()
 
         # 9. Save the final model
-        save_path = "deepvol_rv_model.pth"
+        save_path = "deepvol_rv_model_l1.pth"
         torch.save(model.state_dict(), save_path) # Save the state_dict directly
         print(f"💾 DeepVol weights saved → {save_path}")
