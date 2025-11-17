@@ -1,4 +1,5 @@
 # ======= PRE-IMPORT WORKAROUND =======
+# For potential Windows DLL conflicts
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 # =====================================
@@ -12,7 +13,7 @@ import torch.nn.functional as F
 import lightning.pytorch as pl
 from torch.utils.data import DataLoader, TensorDataset, Subset
 from lightning.pytorch.callbacks import EarlyStopping, TQDMProgressBar
-from torch.nn import L1Loss
+from torch.nn import L1Loss # Using MAE loss for training
 
 # --- Imports for Evaluation ---
 import matplotlib.pyplot as plt
@@ -26,7 +27,7 @@ EPS         = 1e-11        # numerical guard (fixed)
 FORWARD     = 5            # forecast horizon in minutes (fixed)
 TRADING_DAYS_PER_YEAR = 252
 
-# --- NEW: Annualization Factor Dictionary ---
+# --- Annualization Factor Dictionary ---
 # Based on a standard 390-minute trading day (e.g., 9:30-16:00)
 TRADING_MINS_PER_DAY = 390
 
@@ -46,14 +47,14 @@ ANNUALIZATION_FACTORS = {
 
 # ─── PARAMS WE *CAN* TUNE  ────────────────────────────────────────────────
 DEFAULTS = dict(
-    window_size       = 10,
+    window_size       = 10, # Number of past 5-min periods to use as features
     batch_size        = 512,
     max_epochs        = 100,
     patience          = 15, # EarlyStopping patience
     lr_patience       = 5,  # ReduceLROnPlateau patience
     kernel_size       = 3,
     num_blocks        = 4,
-    num_layers        = 6,
+    num_layers        = 6,  # This is num_blocks in your original code
     residual_channels = 16,
     dilation_channels = 32,
     skip_channels     = 64,
@@ -61,12 +62,6 @@ DEFAULTS = dict(
 )
 # -----
 # =======DATA PREP=======
-
-def calculate_realized_volatility(log_returns, window=5):
-    """Calculates rolling realized volatility (sqrt of sum of squares)."""
-    return log_returns.rolling(window=window).apply(
-        lambda x: np.sqrt(np.sum(x**2)), raw=True
-    )
 
 def create_sequences(data, target, sequence_length):
     """Creates sequences of past data (X) and corresponding targets (y)."""
@@ -78,7 +73,7 @@ def create_sequences(data, target, sequence_length):
 
 def prepare_rv_data(df, window_size: int = DEFAULTS['window_size']):
     """
-    --- UPDATED ---
+    --- UPDATED: Uses EWMA-Vol proxy ---
     Uses the static ANNUALIZATION_FACTORS dictionary
     to apply the correct factor to each horizon.
     """
@@ -87,31 +82,32 @@ def prepare_rv_data(df, window_size: int = DEFAULTS['window_size']):
     df_market = df.copy()
     df_market['log_return'] = df_market['return'].fillna(0).astype(np.float32)
     
-    # --- REMOVED: Dynamic Annualization Factor --    
-    # 2. Calculate Realized Volatility (RV) and Annualize it
-    grouped_returns = df_market.groupby(df_market.index.floor('D'))['log_return']
+    # 2. Calculate EWMA Volatility and Annualize it
+    #    Group by day to prevent window crossing midnight
+    grouped_log_returns = df_market.groupby(df_market.index.floor('D'))['log_return']
     
-    # --- UPDATED: Apply correct factor from dictionary ---
-    print("Applying annualization factors:")
-    print(f"  5-min factor: {ANNUALIZATION_FACTORS[5]:.2f}")
-    print(f" 10-min factor: {ANNUALIZATION_FACTORS[10]:.2f}")
-    print(f" 20-min factor: {ANNUALIZATION_FACTORS[20]:.2f}")
-    print(f" 30-min factor: {ANNUALIZATION_FACTORS[30]:.2f}")
+    # --- UPDATED: Calculate EWMA of Volatility ---
+    # We apply sqrt(ewm(span=X).mean()) to the squared returns
+    print("Calculating EWMA Volatility and applying annualization factors:")
+    print(f"  5-min factor: {ANNUALIZATION_FACTORS[5]:.2f} (span=5)")
+    print(f" 10-min factor: {ANNUALIZATION_FACTORS[10]:.2f} (span=10)")
+    print(f" 20-min factor: {ANNUALIZATION_FACTORS[20]:.2f} (span=20)")
+    print(f" 30-min factor: {ANNUALIZATION_FACTORS[30]:.2f} (span=30)")
 
-    df_market['rv_5min'] = grouped_returns.apply(
-        lambda x: calculate_realized_volatility(x, window=5)
+    df_market['rv_5min'] = grouped_log_returns.apply(
+        lambda x: np.sqrt(x.pow(2).ewm(span=5).mean())
     ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[5]
     
-    df_market['rv_10min'] = grouped_returns.apply(
-        lambda x: calculate_realized_volatility(x, window=10)
+    df_market['rv_10min'] = grouped_log_returns.apply(
+        lambda x: np.sqrt(x.pow(2).ewm(span=10).mean())
     ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[10]
     
-    df_market['rv_20min'] = grouped_returns.apply(
-        lambda x: calculate_realized_volatility(x, window=20)
+    df_market['rv_20min'] = grouped_log_returns.apply(
+        lambda x: np.sqrt(x.pow(2).ewm(span=20).mean())
     ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[20]
     
-    df_market['rv_30min'] = grouped_returns.apply(
-        lambda x: calculate_realized_volatility(x, window=30)
+    df_market['rv_30min'] = grouped_log_returns.apply(
+        lambda x: np.sqrt(x.pow(2).ewm(span=30).mean())
     ).reset_index(level=0, drop=True) * ANNUALIZATION_FACTORS[30]
 
     
@@ -168,6 +164,7 @@ def load_set(csv_path: str, window_size = DEFAULTS['window_size']):
         print("Error: CSV must contain 'timestamp', 'market_status', and 'return' columns.")
         return None
     
+    # This correctly converts to datetime and sets the index
     df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
     df = df.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
 
@@ -194,8 +191,8 @@ def load_set(csv_path: str, window_size = DEFAULTS['window_size']):
 
 
 # =======DIALED CASUAL CONVOLUTION=======
-# (This section is unchanged)
 class GatedDCC(nn.Module):
+    """A gated dilated‑causal convolution with residual & skip connections."""
     def __init__(self, in_ch, res_ch, dil_ch, skip_ch, k,dilation):
         super().__init__()
         pad = (dilation * (k-1)) // 2
@@ -234,7 +231,6 @@ class DeepVol(nn.Module):
         return out
 
 #=======TRAINING SCRIPT=======
-# (This section is unchanged)
 class VolModel(pl.LightningModule):
     def __init__(self, **h):
         super().__init__()
@@ -242,7 +238,7 @@ class VolModel(pl.LightningModule):
         self.model = DeepVol(**{k: h[k] for k in (
             "num_blocks","kernel_size","residual_channels",
             "dilation_channels","skip_channels","end_channels")})
-        self.loss  = L1Loss(reduction='mean')
+        self.loss  = L1Loss(reduction='mean') # Using MAE/L1 Loss
         
     def forward(self, x):          
         return self.model(x)
@@ -267,14 +263,14 @@ class VolModel(pl.LightningModule):
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"}}
 
-# ======= EVALUATION FUNCTIONS (ADAPTED) =======
-# (This section is unchanged)
-def evaluate_model(model: pl.LightningModule,
-                   test_loader: DataLoader,
-                   device: torch.device,
-                   eps: float = 1e-11):
+# ======= EVALUATION FUNCTIONS =======
+
+def get_predictions(model: pl.LightningModule,
+                    test_loader: DataLoader,
+                    device: torch.device):
     """
-    Compute RMSE, MAE and QLIKE on our log-RV-to-log-RV model.
+    Gets model predictions (y_pred_rv) and true targets (y_true_rv)
+    from the test_loader, already converted from log-space.
     """
     model.eval()
     model.to(device)
@@ -290,24 +286,12 @@ def evaluate_model(model: pl.LightningModule,
     y_pred_log_rv = torch.cat(all_preds_log_rv).numpy().astype(np.float64)
     y_true_log_rv = torch.cat(all_targets_log_rv).numpy().astype(np.float64)
 
+    # Exponentiate to get back to actual volatility
     y_pred_rv = np.exp(y_pred_log_rv)
     y_true_rv = np.exp(y_true_log_rv) # This is the 5-min target
+    
+    return y_true_rv, y_pred_rv
 
-    # --- Calculate metrics ---
-    rmse = np.sqrt(mean_squared_error(y_true_rv, y_pred_rv))
-    mae = mean_absolute_error(y_true_rv, y_pred_rv)
-    y_true_var = np.square(y_true_rv); y_pred_var = np.square(y_pred_rv)
-    qlike = np.mean(np.log(y_pred_var + eps) + y_true_var / (y_pred_var + eps))
-
-    print("\n––– Model Evaluation (Test Set) –––")
-    print(f"Metrics vs. 5-min Target")
-    print(f"RMSE (on Vol):  {rmse:.6f}")
-    print(f"MAE (on Vol):   {mae:.6f}")
-    print(f"QLIKE (on Var): {qlike:.6f}")
-
-    metrics = {"rmse": rmse, "mae": mae, "qlike": qlike}
-    # Return 5-min true, 5-min pred
-    return y_true_rv, y_pred_rv, metrics
 
 def plot_single_horizon(y_pred: np.ndarray,
                         y_true: np.ndarray,
@@ -332,11 +316,11 @@ def plot_single_horizon(y_pred: np.ndarray,
 
     plt.figure(figsize=(15, 6))
     
-    plt.plot(x_range, y_t_slice, label=f"Actual ({horizon_label} RV)", linewidth=2, color='blue', alpha=0.8)
-    plt.plot(x_range, y_p_slice, label="Model (5-min Prediction)", linewidth=2, linestyle="--", color='red')
+    plt.plot(x_range, y_t_slice, label=f"Actual ({horizon_label} EWMA-RV)", linewidth=2, color='blue', alpha=0.8)
+    plt.plot(x_range, y_p_slice, label="Model (5-min EWMA Prediction)", linewidth=2, linestyle="--", color='red')
     
-    title = f"Model 5-min Forecast vs. Actual {horizon_label} RV (Indices {start}–{end-1})"
-    filename = f"comparison_{horizon_label.replace('-', '')}.png"
+    title = f"Model 5-min Forecast vs. Actual {horizon_label} EWMA-RV (Indices {start}–{end-1})"
+    filename = f"comparison_ewma_{horizon_label.replace('-', '')}.png"
     
     plt.title(title)
     plt.xlabel("Sample Index")
@@ -349,7 +333,35 @@ def plot_single_horizon(y_pred: np.ndarray,
     plt.show()
 
 
-# --- Main execution block (replaces train_deepvol function) ---
+def plot_scatter_horizon(y_pred: np.ndarray,
+                         y_true: np.ndarray,
+                         horizon_label: str):
+    """
+    Plots a scatter plot of 5-min predictions vs. a true RV horizon.
+    """
+    plt.figure(figsize=(8, 8))
+    max_val = max(y_true.max(), y_pred.max()) * 1.05
+    min_val = min(y_true.min(), y_pred.min()) * 0.95
+    
+    plt.scatter(y_true, y_pred, alpha=0.3, label=f'Model (5m) vs Actual ({horizon_label})')
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Fit (y=x)')
+    
+    title = f'Prediction (5-min) vs. Actual ({horizon_label}) Scatter Plot'
+    filename = f'scatter_ewma_{horizon_label.replace("-", "")}.png'
+    
+    plt.title(title)
+    plt.xlabel(f'Actual {horizon_label} EWMA-Vol')
+    plt.ylabel('Predicted 5-min EWMA-Vol')
+    plt.legend()
+    plt.grid(True)
+    plt.xlim(min_val, max_val)
+    plt.ylim(min_val, max_val)
+    plt.savefig(filename)
+    print(f"Saved {filename}")
+    plt.show()
+
+
+# --- Main execution block ---
 if __name__ == "__main__":
     pl.seed_everything(42) # for reproducibility
     
@@ -403,18 +415,20 @@ if __name__ == "__main__":
         trainer.fit(model, loader_train, loader_val)
         print("--- Training Complete ---")
 
-        # 6. Evaluate on Test Set
-        print("--- Starting Model Evaluation ---")
+        # 6. --- Get predictions for plotting ---
+        print("--- Generating Predictions for Graphical Evaluation ---")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        y_true_5min, y_pred_5min, test_metrics = evaluate_model(
+        # Get the 5-min true and 5-min predicted volatility
+        y_true_5min, y_pred_5min = get_predictions(
             model, loader_test, device
         )
         
-        # 7. --- UPDATED: Create separate plots ---
-        print("Generating separate evaluation plots...")
+        # 7. --- Create separate line plots ---
+        print("Generating separate line plots...")
         
-        test_indices = test_ds.indices
+        # Get the indices of the test set
+        test_indices = list(range(train_size + valid_size, len(full_dataset)))
         
         # Create a dict of the *test set* plotting data
         plot_data_test = {
@@ -424,14 +438,14 @@ if __name__ == "__main__":
             '30min_actual': plot_data['30min_actual_cont'][test_indices],
         }
 
-        # Define the slice we want to see
+        # Define the slice we want to see (from the *test set*)
         plot_start = 100
         plot_end = 400
 
         # Plot 1: 5-min Prediction vs 5-min Actual
         plot_single_horizon(
             y_pred=y_pred_5min,
-            y_true=plot_data_test['5min_actual'],
+            y_true=plot_data_test['5min_actual'], # Use aligned 5-min true data
             horizon_label="5-min",
             start=plot_start,
             end=plot_end
@@ -455,22 +469,47 @@ if __name__ == "__main__":
             end=plot_end
         )
         
-        # Plot 4: Scatter (vs. 5-min target)
-        plt.figure(figsize=(8, 8))
-        max_val = max(y_true_5min.max(), y_pred_5min.max()) * 1.05
-        min_val = min(y_true_5min.min(), y_pred_5min.min()) * 0.95
-        plt.scatter(y_true_5min, y_pred_5min, alpha=0.3, label='Model vs Actual (5-min)')
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Fit (y=x)')
-        plt.title('Prediction vs. Actual 5-min Scatter Plot')
-        plt.xlabel('Actual 5-min Volatility')
-        plt.ylabel('Predicted 5-min Volatility')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig('scatter_comparison.png')
-        print("Saved scatter_comparison.png")
-        plt.show()
+        # Plot 4: 5-min Prediction vs 30-min Actual
+        plot_single_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['30min_actual'],
+            horizon_label="30-min",
+            start=plot_start,
+            end=plot_end
+        )
+        
+        # 8. --- Create separate scatter plots ---
+        print("Generating separate scatter plots...")
+
+        # Plot 5: Scatter (vs. 5-min target)
+        plot_scatter_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['5min_actual'],
+            horizon_label="5-min"
+        )
+        
+        # Plot 6: Scatter (vs. 10-min target)
+        plot_scatter_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['10min_actual'],
+            horizon_label="10-min"
+        )
+        
+        # Plot 7: Scatter (vs. 20-min target)
+        plot_scatter_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['20min_actual'],
+            horizon_label="20-min"
+        )
+        
+        # Plot 8: Scatter (vs. 30-min target)
+        plot_scatter_horizon(
+            y_pred=y_pred_5min,
+            y_true=plot_data_test['30min_actual'],
+            horizon_label="30-min"
+        )
 
         # 9. Save the final model
-        save_path = "deepvol_rv_model_l1.pth"
+        save_path = "deepvol_ewma_model_l1.pth"
         torch.save(model.state_dict(), save_path) # Save the state_dict directly
         print(f"💾 DeepVol weights saved → {save_path}")
